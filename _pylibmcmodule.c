@@ -160,6 +160,9 @@ static PyObject *PylibMC_Client_get(PylibMC_Client *self, PyObject *arg) {
     uint32_t flags;
     memcached_return error;
 
+    char *key;
+    size_t key_len;
+
     if (!_PylibMC_CheckKey(arg)) {
         return NULL;
     } else if (!PySequence_Length(arg) ) {
@@ -167,9 +170,17 @@ static PyObject *PylibMC_Client_get(PylibMC_Client *self, PyObject *arg) {
         Py_RETURN_NONE;
     }
 
+    key = PyString_AS_STRING(arg);
+    key_len = PyString_GET_SIZE(arg);
+
+    Py_BEGIN_ALLOW_THREADS
+
     mc_val = memcached_get(self->mc,
-            PyString_AS_STRING(arg), PyString_GET_SIZE(arg),
+            key, key_len,
             &val_size, &flags, &error);
+
+    Py_END_ALLOW_THREADS
+
     if (mc_val != NULL) {
         PyObject *r = _PylibMC_parse_memcached_value(mc_val, val_size, flags);
         free(mc_val);
@@ -182,7 +193,9 @@ static PyObject *PylibMC_Client_get(PylibMC_Client *self, PyObject *arg) {
         Py_RETURN_NONE;
     }
 
-    return PylibMC_ErrFromMemcached(self, "memcached_get", error);
+    PyObject* rtn = PylibMC_ErrFromMemcached(self, "memcached_get", error);
+
+    return rtn;
 }
 
 /* {{{ Set commands (set, replace, add, prepend, append) */
@@ -197,6 +210,9 @@ static PyObject *_PylibMC_RunSetCommand(PylibMC_Client *self,
     PyObject *store_val = NULL;
     unsigned int time = 0;
     uint32_t store_flags = 0;
+
+    char *store_val_str;
+    size_t store_val_len;
 
     static char *kws[] = { "key", "val", "time", NULL };
 
@@ -237,9 +253,17 @@ static PyObject *_PylibMC_RunSetCommand(PylibMC_Client *self,
         return NULL;
     }
 
+    store_val_str = PyString_AS_STRING(store_val);
+    store_val_len = PyString_GET_SIZE(store_val);
+
+    Py_BEGIN_ALLOW_THREADS
+
     rc = f(self->mc, key, key_sz,
-           PyString_AS_STRING(store_val), PyString_GET_SIZE(store_val),
+           store_val_str, store_val_len,
            time, store_flags);
+
+    Py_END_ALLOW_THREADS
+
     Py_DECREF(store_val);
 
     switch (rc) {
@@ -303,9 +327,17 @@ static PyObject *PylibMC_Client_delete(PylibMC_Client *self, PyObject *args) {
 
     retval = NULL;
     time = 0;
+
     if (PyArg_ParseTuple(args, "s#|I", &key, &key_sz, &time)
             && _PylibMC_CheckKeyStringAndSize(key, key_sz)) {
-        switch (rc = memcached_delete(self->mc, key, key_sz, time)) {
+
+        Py_BEGIN_ALLOW_THREADS
+
+        rc = memcached_delete(self->mc, key, key_sz, time);
+
+        Py_END_ALLOW_THREADS
+
+        switch (rc) {
             case MEMCACHED_SUCCESS:
                 Py_RETURN_TRUE;
                 break;
@@ -316,7 +348,8 @@ static PyObject *PylibMC_Client_delete(PylibMC_Client *self, PyObject *args) {
                 Py_RETURN_FALSE;
                 break;
             default:
-                return PylibMC_ErrFromMemcached(self, "memcached_delete", rc);
+                retval = PylibMC_ErrFromMemcached(self, "memcached_delete", rc);
+                return retval;
         }
     }
 
@@ -338,9 +371,15 @@ static PyObject *_PylibMC_IncDec(PylibMC_Client *self, uint8_t dir,
             && _PylibMC_CheckKeyStringAndSize(key, key_sz)) {
         memcached_return (*incdec)(memcached_st *, const char *, size_t,
                 unsigned int, uint64_t *);
+
+        Py_BEGIN_ALLOW_THREADS
+
         incdec = (dir == PYLIBMC_INC) ? memcached_increment
                                       : memcached_decrement;
         incdec(self->mc, key, key_sz, delta, &result);
+
+        Py_END_ALLOW_THREADS
+
         retval = PyLong_FromUnsignedLong((unsigned long)result);
     }
 
@@ -440,17 +479,27 @@ static PyObject *PylibMC_Client_get_multi(PylibMC_Client *self, PyObject *args,
      */
     retval = PyDict_New();
 
-    if ((rc = memcached_mget(self->mc, keys, key_lens, nkeys))
-            != MEMCACHED_SUCCESS) {
+    Py_BEGIN_ALLOW_THREADS
+
+    rc = memcached_mget(self->mc, keys, key_lens, nkeys);
+
+    Py_END_ALLOW_THREADS
+
+    if (rc != MEMCACHED_SUCCESS) {
         PylibMC_ErrFromMemcached(self, "memcached_mget", rc);
         goto cleanup;
     }
 
-    while ((curr_val = memcached_fetch(
+    while (!PyErr_Occurred()) {
+        Py_BEGIN_ALLOW_THREADS
+
+        curr_val = memcached_fetch(
                     self->mc, curr_key, &curr_key_len, &curr_val_len,
-                    &curr_flags, &rc)) != NULL
-            && !PyErr_Occurred()) {
-        if (curr_val == NULL && rc == MEMCACHED_END) {
+                    &curr_flags, &rc);
+
+        Py_END_ALLOW_THREADS
+ 
+        if (curr_val == NULL) {
             break;
         } else if (rc == MEMCACHED_BAD_KEY_PROVIDED
                 || rc == MEMCACHED_NO_KEY_PROVIDED) {
@@ -724,9 +773,14 @@ static PyObject *PylibMC_Client_flush_all(PylibMC_Client *self,
     if (time != NULL)
         expire = PyInt_AS_LONG(time);
 
+    Py_BEGIN_ALLOW_THREADS
+
     expire = (expire > 0) ? expire : 0;
 
     rc = memcached_flush(self->mc, expire);
+
+    Py_END_ALLOW_THREADS
+
     if (rc != MEMCACHED_SUCCESS)
         return PylibMC_ErrFromMemcached(self, "delete_multi", rc);
 
